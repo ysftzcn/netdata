@@ -12,7 +12,7 @@ int init_graphite_instance(struct instance *instance)
 {
     instance->worker = simple_connector_worker;
 
-    struct simple_connector_config *connector_specific_config = mallocz(sizeof(struct simple_connector_config));
+    struct simple_connector_config *connector_specific_config = callocz(1, sizeof(struct simple_connector_config));
     instance->config.connector_specific_config = (void *)connector_specific_config;
     connector_specific_config->default_port = 2003;
 
@@ -27,15 +27,20 @@ int init_graphite_instance(struct instance *instance)
 
     instance->end_chart_formatting = NULL;
     instance->end_host_formatting = flush_host_labels;
-    instance->end_batch_formatting = NULL;
+    instance->end_batch_formatting = simple_connector_update_buffered_bytes;
+
+    instance->send_header = NULL;
+    instance->check_response = exporting_discard_response;
 
     instance->buffer = (void *)buffer_create(0);
     if (!instance->buffer) {
         error("EXPORTING: cannot create buffer for graphite exporting connector instance %s", instance->config.name);
         return 1;
     }
-    uv_mutex_init(&instance->mutex);
-    uv_cond_init(&instance->cond_var);
+    if (uv_mutex_init(&instance->mutex))
+        return 1;
+    if (uv_cond_init(&instance->cond_var))
+        return 1;
 
     return 0;
 }
@@ -123,8 +128,8 @@ int format_dimension_collected_graphite_plaintext(struct instance *instance, RRD
     buffer_sprintf(
         instance->buffer,
         "%s.%s.%s.%s%s%s%s " COLLECTED_NUMBER_FORMAT " %llu\n",
-        engine->config.prefix,
-        engine->config.hostname,
+        instance->config.prefix,
+        (host == localhost) ? engine->config.hostname : host->hostname,
         chart_name,
         dimension_name,
         (host->tags) ? ";" : "",
@@ -170,8 +175,8 @@ int format_dimension_stored_graphite_plaintext(struct instance *instance, RRDDIM
     buffer_sprintf(
         instance->buffer,
         "%s.%s.%s.%s%s%s%s " CALCULATED_NUMBER_FORMAT " %llu\n",
-        engine->config.prefix,
-        engine->config.hostname,
+        instance->config.prefix,
+        (host == localhost) ? engine->config.hostname : host->hostname,
         chart_name,
         dimension_name,
         (host->tags) ? ";" : "",

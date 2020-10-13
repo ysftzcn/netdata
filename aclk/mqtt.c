@@ -4,112 +4,86 @@
 #include "../daemon/common.h"
 #include "mqtt.h"
 #include "aclk_lws_wss_client.h"
+#include "aclk_stats.h"
+#include "aclk_rx_msgs.h"
 
-void (*_on_connect)(void *ptr) = NULL;
-void (*_on_disconnect)(void *ptr) = NULL;
+extern usec_t aclk_session_us;
+extern time_t aclk_session_sec;
 
-#ifndef ENABLE_ACLK
-
-inline const char *_link_strerror(int rc)
-{
-    UNUSED(rc);
-    return "no error";
-}
-
-int _link_event_loop(int timeout)
-{
-    UNUSED(timeout);
-    return 0;
-}
-
-int _link_send_message(char *topic, char *message, int *mid)
-{
-    UNUSED(topic);
-    UNUSED(message);
-    UNUSED(mid);
-    return 0;
-}
-
-int _link_subscribe(char  *topic, int qos)
-{
-    UNUSED(topic);
-    UNUSED(qos);
-    return 0;
-}
-
-void _link_shutdown()
-{
-    return;
-}
-
-int _link_lib_init(char *aclk_hostname, int aclk_port, void (*on_connect)(void *), void (*on_disconnect)(void *))
-{
-    UNUSED(aclk_hostname);
-    UNUSED(aclk_port);
-    UNUSED(on_connect);
-    UNUSED(on_disconnect);
-    return 0;
-}
-
-#else
-
-struct mosquitto *mosq = NULL;
-
-// Get a string description of the error
 inline const char *_link_strerror(int rc)
 {
     return mosquitto_strerror(rc);
 }
+
+#ifdef NETDATA_INTERNAL_CHECKS
+static struct timeval sendTimes[1024];
+#endif
+
+static struct mosquitto *mosq = NULL;
+
 
 void mqtt_message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *msg)
 {
     UNUSED(mosq);
     UNUSED(obj);
 
-    aclk_handle_cloud_request(msg->payload);
+    aclk_handle_cloud_message(msg->payload);
 }
-
-// This is not define because in future we might want to try plain
-// MQTT as fallback ?
-// e.g. try 1st MQTT-WSS, 2nd MQTT plain, 3rd https fallback...
-int mqtt_over_websockets = 1;
-struct aclk_lws_wss_engine_instance *lws_engine_instance = NULL;
 
 void publish_callback(struct mosquitto *mosq, void *obj, int rc)
 {
     UNUSED(mosq);
     UNUSED(obj);
     UNUSED(rc);
+#ifdef NETDATA_INTERNAL_CHECKS
+    struct timeval now, *orig;
+    now_realtime_timeval(&now);
+    orig = &sendTimes[ rc & 0x3ff ];
+    int64_t diff = (now.tv_sec - orig->tv_sec) * USEC_PER_SEC + (now.tv_usec - orig->tv_usec);
+    diff /= 1000;
 
-    // TODO: link this with a msg_id so it can be traced
+    info("Publish_callback: mid=%d latency=%" PRId64 "ms", rc, diff);
+
+    if (aclk_stats_enabled) {
+        ACLK_STATS_LOCK;
+        if (aclk_metrics_per_sample.latency_max < diff)
+            aclk_metrics_per_sample.latency_max = diff;
+
+        aclk_metrics_per_sample.latency_total += diff;
+        aclk_metrics_per_sample.latency_count++;
+        ACLK_STATS_UNLOCK;
+    }
+#endif
     return;
 }
 
 void connect_callback(struct mosquitto *mosq, void *obj, int rc)
 {
+    UNUSED(mosq);
     UNUSED(obj);
     UNUSED(rc);
 
     info("Connection to cloud estabilished");
-
-    aclk_mqtt_connected = 1;
-    _on_connect((void *)mosq);
+    aclk_connect();
 
     return;
 }
 
 void disconnect_callback(struct mosquitto *mosq, void *obj, int rc)
 {
+    UNUSED(mosq);
     UNUSED(obj);
     UNUSED(rc);
 
-    info("Connection to cloud failed");
+    if (netdata_exit)
+        info("Connection to cloud terminated due to agent shutdown");
+    else {
+        errno = 0;
+        error("Connection to cloud failed");
+    }
+    aclk_disconnect();
 
-    aclk_mqtt_connected = 0;
-    _on_disconnect((void *)mosq);
-
-    if (mqtt_over_websockets && lws_engine_instance)
-        aclk_lws_wss_mqtt_layer_disconect_notif(lws_engine_instance);
+    aclk_lws_wss_mqtt_layer_disconect_notif();
 
     return;
 }
@@ -126,27 +100,28 @@ void _show_mqtt_info()
 
 size_t _mqtt_external_write_hook(void *buf, size_t count)
 {
-    return aclk_lws_wss_client_write(lws_engine_instance, buf, count);
+    return aclk_lws_wss_client_write(buf, count);
 }
 
 size_t _mqtt_external_read_hook(void *buf, size_t count)
 {
-    return aclk_lws_wss_client_read(lws_engine_instance, buf, count);
+    return aclk_lws_wss_client_read(buf, count);
 }
 
-int _mqtt_lib_init(void (*on_connect)(void *), void (*on_disconnect)(void *))
+int _mqtt_lib_init()
 {
     int rc;
-    int libmosq_major, libmosq_minor, libmosq_revision, libmosq_version;
+    //int libmosq_major, libmosq_minor, libmosq_revision, libmosq_version;
+    /* Commenting out now as it is unused - do not delete, this is needed for the on-prem version.
     char *ca_crt;
     char *server_crt;
     char *server_key;
 
     // show library info so can have it in the logfile
-    libmosq_version = mosquitto_lib_version(&libmosq_major, &libmosq_minor, &libmosq_revision);
-    ca_crt = config_get(CONFIG_SECTION_ACLK, "agent cloud link cert", "*");
-    server_crt = config_get(CONFIG_SECTION_ACLK, "agent cloud link server cert", "*");
-    server_key = config_get(CONFIG_SECTION_ACLK, "agent cloud link server key", "*");
+    //libmosq_version = mosquitto_lib_version(&libmosq_major, &libmosq_minor, &libmosq_revision);
+    ca_crt = config_get(CONFIG_SECTION_CLOUD, "link cert", "*");
+    server_crt = config_get(CONFIG_SECTION_CLOUD, "link server cert", "*");
+    server_key = config_get(CONFIG_SECTION_CLOUD, "link server key", "*");
 
     if (ca_crt[0] == '*') {
         freez(ca_crt);
@@ -162,6 +137,7 @@ int _mqtt_lib_init(void (*on_connect)(void *), void (*on_disconnect)(void *))
         freez(server_key);
         server_key = NULL;
     }
+    */
 
     //    info(
     //        "Detected libmosquitto library version %d, %d.%d.%d", libmosq_version, libmosq_major, libmosq_minor,
@@ -172,24 +148,35 @@ int _mqtt_lib_init(void (*on_connect)(void *), void (*on_disconnect)(void *))
         error("Failed to initialize MQTT (libmosquitto library)");
         return 1;
     }
+    return 0;
+}
 
-    mosq = mosquitto_new("anon", true, NULL);
+static int _mqtt_create_connection(char *username, char *password)
+{
+    if (mosq != NULL)
+        mosquitto_destroy(mosq);
+    mosq = mosquitto_new(username, true, NULL);
     if (unlikely(!mosq)) {
         mosquitto_lib_cleanup();
         error("MQTT new structure  -- %s", mosquitto_strerror(errno));
-        return 1;
+        return MOSQ_ERR_UNKNOWN;
     }
 
-    _on_connect = on_connect;
-    _on_disconnect = on_disconnect;
+    // Record the session start time to allow a nominal LWT timestamp
+    usec_t now = now_realtime_usec();
+    aclk_session_sec = now / USEC_PER_SEC;
+    aclk_session_us = now % USEC_PER_SEC;  
+
+    _link_set_lwt("outbound/meta", 2);
 
     mosquitto_connect_callback_set(mosq, connect_callback);
     mosquitto_disconnect_callback_set(mosq, disconnect_callback);
     mosquitto_publish_callback_set(mosq, publish_callback);
 
-    mosquitto_username_pw_set(mosq, NULL, NULL);
+    info("Using challenge-response: %s / %s", username, password);
+    mosquitto_username_pw_set(mosq, username, password);
 
-    rc = mosquitto_threaded_set(mosq, 1);
+    int rc = mosquitto_threaded_set(mosq, 1);
     if (unlikely(rc != MOSQ_ERR_SUCCESS))
         error("Failed to tune the thread model for libmoquitto (%s)", mosquitto_strerror(rc));
 
@@ -202,19 +189,10 @@ int _mqtt_lib_init(void (*on_connect)(void *), void (*on_disconnect)(void *))
     info("MQTT in flight messages set to 1  -- %s", mosquitto_strerror(rc));
 #endif
 
-    if (!mqtt_over_websockets) {
-        rc = mosquitto_reconnect_delay_set(mosq, ACLK_RECONNECT_DELAY, ACLK_MAX_BACKOFF_DELAY, 1);
-
-        if (unlikely(rc != MOSQ_ERR_SUCCESS))
-            error("Failed to set the reconnect delay (%d) (%s)", rc, mosquitto_strerror(rc));
-
-        mosquitto_tls_set(mosq, ca_crt, NULL, server_crt, server_key, NULL);
-    }
-
     return rc;
 }
 
-int _link_mqtt_connect(char *aclk_hostname, int aclk_port)
+static int _link_mqtt_connect(char *aclk_hostname, int aclk_port)
 {
     int rc;
 
@@ -234,8 +212,9 @@ static inline void _link_mosquitto_write()
 {
     int rc;
 
-    if (!mqtt_over_websockets)
+    if (unlikely(!mosq)) {
         return;
+    }
 
     rc = mosquitto_loop_misc(mosq);
     if (unlikely(rc != MOSQ_ERR_SUCCESS))
@@ -248,15 +227,13 @@ static inline void _link_mosquitto_write()
     }
 }
 
-void aclk_lws_connect_notif_callback()
+void aclk_lws_connection_established(char *hostname, int port)
 {
-    //the connection is done by LWS so this parameters dont matter
-    //ig MQTT over LWS is used
-    _link_mqtt_connect(aclk_hostname, aclk_port);
+    _link_mqtt_connect(hostname, port);  // Parameters only used for logging, lower layer connected.
     _link_mosquitto_write();
 }
 
-void aclk_lws_data_received_callback()
+void aclk_lws_connection_data_received()
 {
     int rc = mosquitto_loop_read(mosq, 1);
     if (rc != MOSQ_ERR_SUCCESS)
@@ -265,93 +242,43 @@ void aclk_lws_data_received_callback()
 
 void aclk_lws_connection_closed()
 {
-    aclk_disconnect(NULL);
+    aclk_disconnect();
+
 }
 
-static const struct aclk_lws_wss_engine_callbacks aclk_lws_engine_callbacks = {
-    .connection_established_callback = aclk_lws_connect_notif_callback,
-    .data_rcvd_callback = aclk_lws_data_received_callback,
-    .data_writable_callback = NULL,
-    .connection_closed = aclk_lws_connection_closed
-};
 
-int _link_lib_init(char *aclk_hostname, int aclk_port, void (*on_connect)(void *), void (*on_disconnect)(void *))
+int mqtt_attempt_connection(char *aclk_hostname, int aclk_port, char *username, char *password)
 {
-    int rc;
+    if(aclk_lws_wss_connect(aclk_hostname, aclk_port))
+        return MOSQ_ERR_UNKNOWN;
+    aclk_lws_wss_service_loop();
 
-    if (mqtt_over_websockets) {
-        // we will connect when WebSocket connection is up
-        // based on callback
-        if (!lws_engine_instance)
-            lws_engine_instance = aclk_lws_wss_client_init(&aclk_lws_engine_callbacks, aclk_hostname, aclk_port);
-        else
-            aclk_lws_wss_connect(lws_engine_instance);
-
-        aclk_lws_wss_service_loop(lws_engine_instance);
-    }
-
-    rc = _mqtt_lib_init(on_connect, on_disconnect);
-    if (rc != MOSQ_ERR_SUCCESS)
+    int rc = _mqtt_create_connection(username, password);
+    if (rc!= MOSQ_ERR_SUCCESS)
         return rc;
 
-    if (mqtt_over_websockets) {
-        mosquitto_external_callbacks_set(mosq, _mqtt_external_write_hook, _mqtt_external_read_hook);
-        if (!lws_engine_instance)
-            return 1;
-        else
-            return MOSQ_ERR_SUCCESS;
-    } else {
-        // if direct mqtt connection is used
-        // connect immediatelly
-        return _link_mqtt_connect(aclk_hostname, aclk_port);
-    }
+    mosquitto_external_callbacks_set(mosq, _mqtt_external_write_hook, _mqtt_external_read_hook);
+    return rc;
 }
 
-static inline int _link_event_loop_wss()
+inline int _link_event_loop()
 {
-    if (unlikely(!lws_engine_instance)) {
-        return MOSQ_ERR_SUCCESS;
-    }
 
-    if (lws_engine_instance && lws_engine_instance->websocket_connection_up)
-        _link_mosquitto_write();
+    // TODO: Check if we need to flush undelivered messages from libmosquitto on new connection attempts (QoS=1).
+    _link_mosquitto_write();
+    aclk_lws_wss_service_loop();
 
-    aclk_lws_wss_service_loop(lws_engine_instance);
     // this is because if use LWS we don't want
     // mqtt to reconnect by itself
     return MOSQ_ERR_SUCCESS;
 }
 
-static inline int _link_event_loop_plain_mqtt(int timeout)
-{
-    int rc;
-
-    rc = mosquitto_loop(mosq, timeout, 1);
-
-    if (unlikely(rc != MOSQ_ERR_SUCCESS)) {
-        errno = 0;
-        error("Loop error code %d (%s)", rc, mosquitto_strerror(rc));
-        rc = mosquitto_reconnect(mosq);
-        if (unlikely(rc != MOSQ_ERR_SUCCESS)) {
-            error("Reconnect loop error code %d (%s)", rc, mosquitto_strerror(rc));
-        }
-        // TBD: Using delay
-        sleep_usec(USEC_PER_SEC * 10);
-    }
-    return rc;
-}
-
-int _link_event_loop(int timeout)
-{
-    if (mqtt_over_websockets)
-        return _link_event_loop_wss();
-
-    return _link_event_loop_plain_mqtt(timeout);
-}
-
 void _link_shutdown()
 {
     int rc;
+
+    if (likely(!mosq))
+        return;
 
     rc = mosquitto_disconnect(mosq);
     switch (rc) {
@@ -362,16 +289,30 @@ void _link_shutdown()
             info("MQTT invalid structure");
             break;
     };
+}
 
-    mosquitto_destroy(mosq);
-    mosq = NULL;
 
-    if (lws_engine_instance) {
-        aclk_lws_wss_client_destroy(lws_engine_instance);
-        lws_engine_instance = NULL;
+int _link_set_lwt(char *sub_topic, int qos)
+{
+    int rc;
+    char topic[ACLK_MAX_TOPIC + 1];
+    char *final_topic;
+
+    final_topic = get_topic(sub_topic, topic, ACLK_MAX_TOPIC);
+    if (unlikely(!final_topic)) {
+        errno = 0;
+        error("Unable to build outgoing topic; truncated?");
+        return 1;
     }
 
-    return;
+    usec_t lwt_time = aclk_session_sec * USEC_PER_SEC + aclk_session_us + 1;
+    BUFFER *b = buffer_create(512);
+    aclk_create_header(b, "disconnect", NULL, lwt_time / USEC_PER_SEC, lwt_time % USEC_PER_SEC, ACLK_VERSION_NEG_VERSION);
+    buffer_strcat(b, ", \"payload\": \"unexpected\" }");
+    rc = mosquitto_will_set(mosq, topic, buffer_strlen(b), buffer_tostring(b), qos, 0);
+    buffer_free(b);
+
+    return rc;
 }
 
 int _link_subscribe(char *topic, int qos)
@@ -391,7 +332,6 @@ int _link_subscribe(char *topic, int qos)
     }
 
     _link_mosquitto_write();
-
     return 0;
 }
 
@@ -400,27 +340,35 @@ int _link_subscribe(char *topic, int qos)
  *
  */
 
-int _link_send_message(char *topic, char *message, int *mid)
+int _link_send_message(char *topic, const void *message, size_t len, int *mid)
 {
     int rc;
+    size_t write_q, write_q_bytes, read_q;
 
     rc = mosquitto_pub_topic_check(topic);
 
     if (unlikely(rc != MOSQ_ERR_SUCCESS))
         return rc;
 
-    int msg_len = strlen(message);
+    lws_wss_check_queues(&write_q, &write_q_bytes, &read_q);
+    rc = mosquitto_publish(mosq, mid, topic, len, message, ACLK_QOS, 0);
 
-    rc = mosquitto_publish(mosq, mid, topic, msg_len, message, ACLK_QOS, 0);
+#ifdef NETDATA_INTERNAL_CHECKS
+    char msg_head[64];
+    memset(msg_head, 0, sizeof(msg_head));
+    strncpy(msg_head, (char*)message, 60);
+    for (size_t i = 0; i < sizeof(msg_head); i++)
+        if(msg_head[i] == '\n') msg_head[i] = ' ';
+    info("Sending MQTT len=%d mid=%d wq=%zu (%zu-bytes) readq=%zu: %s", (int)len,
+         *mid, write_q, write_q_bytes, read_q, msg_head);
+    now_realtime_timeval(&sendTimes[ *mid & 0x3ff ]);
+#endif
 
     // TODO: Add better handling -- error will flood the logfile here
     if (unlikely(rc != MOSQ_ERR_SUCCESS)) {
         errno = 0;
         error("MQTT message failed : %s", mosquitto_strerror(rc));
     }
-
     _link_mosquitto_write();
-
     return rc;
 }
-#endif

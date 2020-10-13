@@ -32,6 +32,7 @@ PACKAGES_UPDATE_IPSETS=${PACKAGES_UPDATE_IPSETS-0}
 PACKAGES_NETDATA_DEMO_SITE=${PACKAGES_NETDATA_DEMO_SITE-0}
 PACKAGES_NETDATA_SENSORS=${PACKAGES_NETDATA_SENSORS-0}
 PACKAGES_NETDATA_DATABASE=${PACKAGES_NETDATA_DATABASE-0}
+PACKAGES_NETDATA_EBPF=${PACKAGES_NETDATA_EBPF-0}
 
 # needed commands
 lsb_release=$(command -v lsb_release 2> /dev/null)
@@ -39,6 +40,8 @@ lsb_release=$(command -v lsb_release 2> /dev/null)
 # Check which package managers are available
 apk=$(command -v apk 2> /dev/null)
 apt_get=$(command -v apt-get 2> /dev/null)
+brew=$(command -v brew 2> /dev/null)
+pkg=$(command -v pkg 2> /dev/null)
 dnf=$(command -v dnf 2> /dev/null)
 emerge=$(command -v emerge 2> /dev/null)
 equo=$(command -v equo 2> /dev/null)
@@ -75,8 +78,9 @@ Supported distributions (DD):
     - sabayon        (all Sabayon Linux derivatives)
     - debian, ubuntu (all Debian and Ubuntu derivatives)
     - redhat, fedora (all Red Hat and Fedora derivatives)
-    - suse, opensuse (all SuSe and openSuSe derivatives)
+    - suse, opensuse (all SUSE and openSUSE derivatives)
     - clearlinux     (all Clear Linux derivatives)
+    - macos          (Apple's macOS)
 
 Supported installers (IN):
 
@@ -86,9 +90,11 @@ Supported installers (IN):
     - equo           all Sabayon Linux derivatives
     - pacman         all Arch Linux derivatives
     - yum            all Red Hat / Fedora / CentOS Linux derivatives
-    - zypper         all SuSe Linux derivatives
+    - zypper         all SUSE Linux derivatives
     - apk            all Alpine derivatives
     - swupd          all Clear Linux derivatives
+    - brew           macOS Homebrew
+    - pkg            FreeBSD Ports
 
 Supported packages (you can append many of them):
 
@@ -192,7 +198,7 @@ get_os_release() {
   eval "$(grep -E "^(NAME|ID|ID_LIKE|VERSION|VERSION_ID)=" "${os_release_file}")"
   for x in "${ID}" ${ID_LIKE}; do
     case "${x,,}" in
-      alpine | arch | centos | debian | fedora | gentoo | sabayon | rhel | ubuntu | suse | opensuse-leap | sles | clear-linux-os)
+      alpine | arch | centos | clear-linux-os | debian | fedora | gentoo | manjaro | opensuse-leap | rhel | sabayon | sles | suse | ubuntu)
         distribution="${x}"
         version="${VERSION_ID}"
         codename="${VERSION}"
@@ -267,8 +273,30 @@ find_etc_any_release() {
 }
 
 autodetect_distribution() {
-  # autodetection of distribution
-  get_os_release || get_lsb_release || find_etc_any_release
+  # autodetection of distribution/OS
+  case "$(uname -s)" in
+    "Linux")
+      get_os_release || get_lsb_release || find_etc_any_release
+      ;;
+    "FreeBSD")
+      distribution="freebsd"
+      version="$(uname -r)"
+      detection="uname"
+      ;;
+    "Darwin")
+      distribution="macos"
+      version="$(uname -r)"
+      detection="uname"
+
+      if [ ${EUID} -eq 0 ]; then
+        echo >&2 "This script does not support running as EUID 0 on macOS. Please run it as a regular user."
+        exit 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 user_picks_distribution() {
@@ -302,6 +330,8 @@ user_picks_distribution() {
   [ -n "${equo}" ] && echo >&2 " - Sabayon based (installer is: equo)" && opts="equo ${opts}"
   [ -n "${apk}" ] && echo >&2 " - Alpine Linux based (installer is: apk)" && opts="apk ${opts}"
   [ -n "${swupd}" ] && echo >&2 " - Clear Linux based (installer is: swupd)" && opts="swupd ${opts}"
+  [ -n "${brew}" ] && echo >&2 " - macOS based (installer is: brew)" && opts="brew ${opts}"
+  # XXX: This is being removed in another PR.
   echo >&2
 
   REPLY=
@@ -417,11 +447,28 @@ detect_package_manager_from_distribution() {
       fi
       ;;
 
-    clear-linux* | clearlinux* )
+    clear-linux* | clearlinux*)
       package_installer="install_swupd"
       tree="clearlinux"
       if [ "${IGNORE_INSTALLED}" -eq 0 ] && [ -z "${swupd}" ]; then
         echo >&2 "command 'swupd' is required to install packages on a '${distribution} ${version}' system."
+        exit 1
+      fi
+      ;;
+
+    freebsd)
+      package_installer="install_pkg"
+      tree="freebsd"
+      if [ "${IGNORE_INSTALLED}" -eq 0 ] && [ -z "${pkg}" ]; then
+        echo >&2 "command 'pkg' is required to install packages on a '${distribution} ${version}' system."
+        exit 1
+      fi
+      ;;
+    macos)
+      package_installer="install_brew"
+      tree="macos"
+      if [ "${IGNORE_INSTALLED}" -eq 0 ] && [ -z "${brew}" ]; then
+        echo >&2 "command 'brew' is required to install packages on a '${distribution} ${version}' system."
         exit 1
       fi
       ;;
@@ -433,6 +480,7 @@ detect_package_manager_from_distribution() {
   esac
 }
 
+# XXX: This is being removed in another PR.
 check_package_manager() {
   # This is called only when the user is selecting a package manager
   # It is used to verify the user selection is right
@@ -517,6 +565,15 @@ check_package_manager() {
       return 0
       ;;
 
+    brew)
+      [ "${IGNORE_INSTALLED}" -eq 0 ] && [ -z "${brew}" ] && echo >&2 "${1} is not available." && return 1
+      package_installer="install_brew"
+      tree="macos"
+      detection="user-input"
+
+      return 0
+      ;;
+
     *)
       echo >&2 "Invalid package manager: '${1}'."
       return 1
@@ -543,8 +600,11 @@ require_cmd() {
 }
 
 declare -A pkg_find=(
+  ['gentoo']="sys-apps/findutils"
   ['fedora']="findutils"
   ['clearlinux']="findutils"
+  ['macos']="NOTREQUIRED"
+  ['freebsd']="NOTREQUIRED"
   ['default']="WARNING|"
 )
 
@@ -582,7 +642,6 @@ declare -A pkg_autogen=(
   # exceptions
   ['centos-6']="WARNING|"
   ['rhel-6']="WARNING|"
-  ['ubuntu-18']="WARNING|"
 )
 
 declare -A pkg_automake=(
@@ -591,20 +650,43 @@ declare -A pkg_automake=(
   ['default']="automake"
 )
 
+# required to bundle libJudy
+declare -A pkg_libtool=(
+  ['gentoo']="sys-devel/libtool"
+  ['clearlinux']="c-basic"
+  ['default']="libtool"
+)
+
 # Required to build libwebsockets and libmosquitto on some systems.
 declare -A pkg_cmake=(
+  ['gentoo']="dev-util/cmake"
   ['clearlinux']="c-basic"
   ['default']="cmake"
+)
+
+declare -A pkg_json_c_dev=(
+  ['alpine']="json-c-dev"
+  ['arch']="json-c"
+  ['clearlinux']="devpkg-json-c"
+  ['debian']="libjson-c-dev"
+  ['gentoo']="dev-libs/json-c"
+  ['sabayon']="dev-libs/json-c"
+  ['suse']="libjson-c-devel"
+  ['freebsd']="json-c"
+  ['default']="json-c-devel"
 )
 
 declare -A pkg_bridge_utils=(
   ['gentoo']="net-misc/bridge-utils"
   ['clearlinux']="network-basic"
+  ['macos']="WARNING|"
   ['default']="bridge-utils"
 )
 
 declare -A pkg_chrony=(
+  ['gentoo']="net-misc/chrony"
   ['clearlinux']="time-server-basic"
+  ['macos']="WARNING|"
   ['default']="chrony"
 )
 
@@ -615,11 +697,15 @@ declare -A pkg_curl=(
 )
 
 declare -A pkg_gzip=(
+  ['gentoo']="app-arch/gzip"
+  ['macos']="NOTREQUIRED"
   ['default']="gzip"
 )
 
 declare -A pkg_tar=(
+  ['gentoo']="app-arch/tar"
   ['clearlinux']="os-core-update"
+  ['macos']="NOTREQUIRED"
   ['default']="tar"
 )
 
@@ -631,15 +717,19 @@ declare -A pkg_git=(
 declare -A pkg_gcc=(
   ['gentoo']="sys-devel/gcc"
   ['clearlinux']="c-basic"
+  ['macos']="NOTREQUIRED"
   ['default']="gcc"
 )
 
 declare -A pkg_gdb=(
   ['gentoo']="sys-devel/gdb"
+  ['macos']="NOTREQUIRED"
   ['default']="gdb"
 )
 
 declare -A pkg_iotop=(
+  ['gentoo']="sys-process/iotop"
+  ['macos']="WARNING|"
   ['default']="iotop"
 )
 
@@ -649,6 +739,7 @@ declare -A pkg_iproute2=(
   ['gentoo']="sys-apps/iproute2"
   ['sabayon']="sys-apps/iproute2"
   ['clearlinux']="iproute2"
+  ['macos']="WARNING|"
   ['default']="iproute"
 
   # exceptions
@@ -658,6 +749,7 @@ declare -A pkg_iproute2=(
 declare -A pkg_ipset=(
   ['gentoo']="net-firewall/ipset"
   ['clearlinux']="network-basic"
+  ['macos']="WARNING|"
   ['default']="ipset"
 )
 
@@ -668,6 +760,7 @@ declare -A pkg_jq=(
 
 declare -A pkg_iptables=(
   ['gentoo']="net-firewall/iptables"
+  ['macos']="WARNING|"
   ['default']="iptables"
 )
 
@@ -681,6 +774,8 @@ declare -A pkg_libz_dev=(
   ['rhel']="zlib-devel"
   ['suse']="zlib-devel"
   ['clearlinux']="devpkg-zlib"
+  ['macos']="NOTREQUIRED"
+  ['freebsd']="lzlib"
   ['default']=""
 )
 
@@ -688,11 +783,14 @@ declare -A pkg_libuuid_dev=(
   ['alpine']="util-linux-dev"
   ['arch']="util-linux"
   ['centos']="libuuid-devel"
+  ['clearlinux']="devpkg-util-linux"
   ['debian']="uuid-dev"
   ['gentoo']="sys-apps/util-linux"
   ['sabayon']="sys-apps/util-linux"
   ['rhel']="libuuid-devel"
   ['suse']="libuuid-devel"
+  ['macos']="NOTREQUIRED"
+  ['freebsd']="e2fsprogs-libuuid"
   ['default']=""
 )
 
@@ -706,6 +804,7 @@ declare -A pkg_libmnl_dev=(
   ['rhel']="libmnl-devel"
   ['suse']="libmnl-devel"
   ['clearlinux']="devpkg-libmnl"
+  ['macos']="NOTREQUIRED"
   ['default']=""
 )
 
@@ -714,31 +813,41 @@ declare -A pkg_lm_sensors=(
   ['arch']="lm_sensors"
   ['centos']="lm_sensors"
   ['debian']="lm-sensors"
-  ['gentoo']="sys-apps/lm_sensors"
+  ['gentoo']="sys-apps/lm-sensors"
   ['sabayon']="sys-apps/lm_sensors"
   ['rhel']="lm_sensors"
   ['suse']="sensors"
   ['clearlinux']="lm-sensors"
+  ['macos']="WARNING|"
+  ['freebsd']="NOTREQUIRED"
   ['default']="lm_sensors"
 )
 
 declare -A pkg_logwatch=(
+  ['gentoo']="sys-apps/logwatch"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="logwatch"
 )
 
 declare -A pkg_lxc=(
+  ['gentoo']="app-emulation/lxc"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="lxc"
 )
 
 declare -A pkg_mailutils=(
+  ['gentoo']="net-mail/mailutils"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="mailutils"
 )
 
 declare -A pkg_make=(
   ['gentoo']="sys-devel/make"
+  ['macos']="NOTREQUIRED"
+  ['freebsd']="gmake"
   ['default']="make"
 )
 
@@ -752,6 +861,8 @@ declare -A pkg_netcat=(
   ['rhel']="nmap-ncat"
   ['suse']="netcat-openbsd"
   ['clearlinux']="sysadmin-basic"
+  ['arch']="gnu-netcat"
+  ['macos']="NOTREQUIRED"
   ['default']="netcat"
 
   # exceptions
@@ -767,6 +878,7 @@ declare -A pkg_nginx=(
 declare -A pkg_nodejs=(
   ['gentoo']="net-libs/nodejs"
   ['clearlinux']="nodejs-basic"
+  ['freebsd']="node"
   ['default']="nodejs"
 
   # exceptions
@@ -778,6 +890,8 @@ declare -A pkg_nodejs=(
 )
 
 declare -A pkg_postfix=(
+  ['gentoo']="mail-mta/postfix"
+  ['macos']="WARNING|"
   ['default']="postfix"
 )
 
@@ -790,6 +904,7 @@ declare -A pkg_pkg_config=(
   ['sabayon']="virtual/pkgconfig"
   ['rhel']="pkgconfig"
   ['suse']="pkg-config"
+  ['freebsd']="pkgconf"
   ['clearlinux']="c-basic"
   ['default']="pkg-config"
 )
@@ -801,6 +916,7 @@ declare -A pkg_python=(
   ['default']="python"
 
   # Exceptions
+  ['macos']="WARNING|"
   ['centos-8']="python2"
 )
 
@@ -830,6 +946,7 @@ declare -A pkg_python3_mysqldb=(
   ['rhel']="WARNING|"
   ['suse']="WARNING|"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="WARNING|"
 
   # exceptions
@@ -844,6 +961,10 @@ declare -A pkg_python3_mysqldb=(
   ['ubuntu-14.10']="WARNING|"
   ['ubuntu-15.04']="WARNING|"
   ['ubuntu-15.10']="WARNING|"
+  ['centos-7']="python36-mysql"
+  ['centos-8']="python38-mysql"
+  ['rhel-7']="python36-mysql"
+  ['rhel-8']="python38-mysql"
 )
 
 declare -A pkg_python_psycopg2=(
@@ -856,6 +977,7 @@ declare -A pkg_python_psycopg2=(
   ['rhel']="python-psycopg2"
   ['suse']="python-psycopg2"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="python-psycopg2"
 )
 
@@ -869,7 +991,13 @@ declare -A pkg_python3_psycopg2=(
   ['rhel']="WARNING|"
   ['suse']="WARNING|"
   ['clearlinux']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="WARNING|"
+
+  ['centos-7']="python3-psycopg2"
+  ['centos-8']="python38-psycopg2"
+  ['rhel-7']="python3-psycopg2"
+  ['rhel-8']="python38-psycopg2"
 )
 
 declare -A pkg_python_pip=(
@@ -877,17 +1005,17 @@ declare -A pkg_python_pip=(
   ['gentoo']="dev-python/pip"
   ['sabayon']="dev-python/pip"
   ['clearlinux']="python-basic"
+  ['macos']="WARNING|"
   ['default']="python-pip"
 )
 
 declare -A pkg_python3_pip=(
   ['alpine']="py3-pip"
   ['arch']="python-pip"
-  ['centos']="WARNING|"
   ['gentoo']="dev-python/pip"
   ['sabayon']="dev-python/pip"
-  ['rhel']="WARNING|"
   ['clearlinux']="python3-basic"
+  ['macos']="NOTREQUIRED"
   ['default']="python3-pip"
 )
 
@@ -899,6 +1027,8 @@ declare -A pkg_python_pymongo=(
   ['gentoo']="dev-python/pymongo"
   ['suse']="python-pymongo"
   ['clearlinux']="WARNING|"
+  ['rhel']="WARNING|"
+  ['macos']="WARNING|"
   ['default']="python-pymongo"
 )
 
@@ -910,7 +1040,15 @@ declare -A pkg_python3_pymongo=(
   ['gentoo']="dev-python/pymongo"
   ['suse']="python3-pymongo"
   ['clearlinux']="WARNING|"
+  ['rhel']="WARNING|"
+  ['freebsd']="py37-pymongo"
+  ['macos']="WARNING|"
   ['default']="python3-pymongo"
+
+  ['centos-7']="python36-pymongo"
+  ['centos-8']="python3-pymongo"
+  ['rhel-7']="python36-pymongo"
+  ['rhel-8']="python3-pymongo"
 )
 
 declare -A pkg_python_requests=(
@@ -923,6 +1061,7 @@ declare -A pkg_python_requests=(
   ['rhel']="python-requests"
   ['suse']="python-requests"
   ['clearlinux']="python-extras"
+  ['macos']="WARNING|"
   ['default']="python-requests"
   ['alpine-3.1.4']="WARNING|"
   ['alpine-3.2.3']="WARNING|"
@@ -938,7 +1077,13 @@ declare -A pkg_python3_requests=(
   ['rhel']="WARNING|"
   ['suse']="WARNING|"
   ['clearlinux']="python-extras"
+  ['macos']="WARNING|"
   ['default']="WARNING|"
+
+  ['centos-7']="python36-requests"
+  ['centos-8']="python3-requests"
+  ['rhel-7']="python36-requests"
+  ['rhel-8']="python3-requests"
 )
 
 declare -A pkg_lz4=(
@@ -948,6 +1093,9 @@ declare -A pkg_lz4=(
   ['suse']="liblz4-devel"
   ['gentoo']="app-arch/lz4"
   ['clearlinux']="devpkg-lz4"
+  ['arch']="lz4"
+  ['macos']="lz4"
+  ['freebsd']="liblz4"
   ['default']="lz4-devel"
 )
 
@@ -958,6 +1106,8 @@ declare -A pkg_libuv=(
   ['gentoo']="dev-libs/libuv"
   ['arch']="libuv"
   ['clearlinux']="devpkg-libuv"
+  ['macos']="libuv"
+  ['freebsd']="libuv"
   ['default']="libuv-devel"
 )
 
@@ -967,24 +1117,29 @@ declare -A pkg_openssl=(
   ['ubuntu']="libssl-dev"
   ['suse']="libopenssl-devel"
   ['clearlinux']="devpkg-openssl"
+  ['gentoo']="dev-libs/openssl"
+  ['arch']="openssl"
+  ['freebsd']="openssl"
+  ['macos']="openssl@1.1"
   ['default']="openssl-devel"
 )
 
 declare -A pkg_judy=(
-  ['alpine']="WARNING|" # TODO - need to add code to download and install judy for alpine and clearlinux
-  ['clearlinux']="WARNING|"
   ['debian']="libjudy-dev"
   ['ubuntu']="libjudy-dev"
   ['suse']="judy-devel"
   ['gentoo']="dev-libs/judy"
   ['arch']="judy"
-  ['default']="Judy-devel"
+  ['freebsd']="Judy"
+  ['fedora']="Judy-devel"
+  ['default']="NOTREQUIRED"
 )
 
 declare -A pkg_python3=(
   ['gentoo']="dev-lang/python"
   ['sabayon']="dev-lang/python:3.4"
   ['clearlinux']="python3-basic"
+  ['macos']="python"
   ['default']="python3"
 
   # exceptions
@@ -999,10 +1154,14 @@ declare -A pkg_screen=(
 )
 
 declare -A pkg_sudo=(
+  ['gentoo']="app-admin/sudo"
+  ['macos']="NOTREQUIRED"
   ['default']="sudo"
 )
 
 declare -A pkg_sysstat=(
+  ['gentoo']="app-admin/sysstat"
+  ['macos']="WARNING|"
   ['default']="sysstat"
 )
 
@@ -1016,6 +1175,7 @@ declare -A pkg_traceroute=(
   ['alpine']=" "
   ['gentoo']="net-analyzer/traceroute"
   ['clearlinux']="network-basic"
+  ['macos']="NOTREQUIRED"
   ['default']="traceroute"
 )
 
@@ -1029,21 +1189,48 @@ declare -A pkg_ulogd=(
   ['rhel']="WARNING|"
   ['clearlinux']="WARNING|"
   ['gentoo']="app-admin/ulogd"
+  ['arch']="ulogd"
+  ['macos']="WARNING|"
   ['default']="ulogd2"
 )
 
 declare -A pkg_unzip=(
   ['gentoo']="app-arch/unzip"
+  ['macos']="NOTREQUIRED"
   ['default']="unzip"
 )
 
 declare -A pkg_zip=(
   ['gentoo']="app-arch/zip"
+  ['macos']="NOTREQUIRED"
   ['default']="zip"
 )
 
+declare -A pkg_libelf=(
+  ['alpine']="elfutils-dev"
+  ['arch']="libelf"
+  ['gentoo']="dev-libs/libelf"
+  ['debian']="libelf-dev"
+  ['ubuntu']="libelf-dev"
+  ['fedora']="elfutils-libelf-devel"
+  ['centos']="elfutils-libelf-devel"
+  ['rhel']="elfutils-libelf-devel"
+  ['clearlinux']="devpkg-elfutils"
+  ['suse']="libelf-devel"
+  ['macos']="NOTREQUIRED"
+  ['freebsd']="NOTREQUIRED"
+  ['default']="libelf-devel"
+
+  # exceptions
+  ['alpine-3.5']="libelf-dev"
+  ['alpine-3.4']="libelf-dev"
+  ['alpine-3.3']="libelf-dev"
+)
+
 validate_package_trees() {
-  validate_tree_${tree}
+  if type -t validate_tree_${tree} > /dev/null; then
+    validate_tree_${tree}
+  fi
 }
 
 validate_installed_package() {
@@ -1109,6 +1296,7 @@ packages() {
   suitable_package autoconf-archive
   require_cmd autogen || suitable_package autogen
   require_cmd automake || suitable_package automake
+  require_cmd libtoolize || suitable_package libtool
   require_cmd pkg-config || suitable_package pkg-config
   require_cmd cmake || suitable_package cmake
 
@@ -1164,6 +1352,7 @@ packages() {
     suitable_package libz-dev
     suitable_package libuuid-dev
     suitable_package libmnl-dev
+    suitable_package json-c-dev
   fi
 
   # -------------------------------------------------------------------------
@@ -1174,12 +1363,18 @@ packages() {
   fi
 
   # -------------------------------------------------------------------------
-  # sensors
+  # netdata database
   if [ "${PACKAGES_NETDATA_DATABASE}" -ne 0 ]; then
     suitable_package libuv
     suitable_package lz4
     suitable_package openssl
     suitable_package judy
+  fi
+
+  # -------------------------------------------------------------------------
+  # ebpf plugin
+  if [ "${PACKAGES_NETDATA_EBPF}" -ne 0 ]; then
+    suitable_package libelf
   fi
 
   # -------------------------------------------------------------------------
@@ -1209,7 +1404,6 @@ packages() {
   if [ "${PACKAGES_NETDATA_PYTHON3}" -ne 0 ]; then
     require_cmd python3 || suitable_package python3
 
-    suitable_package python3-pymongo
     [ "${PACKAGES_NETDATA_PYTHON_MONGO}" -ne 0 ] && suitable_package python3-pymongo
     # suitable_package python3-requests
     # suitable_package python3-pip
@@ -1261,14 +1455,6 @@ validate_install_apt_get() {
 }
 
 install_apt_get() {
-  # download the latest package info
-  if [ "${DRYRUN}" -eq 1 ]; then
-    echo >&2 " >> IMPORTANT << "
-    echo >&2 "    Please make sure your system is up to date"
-    echo >&2 "    by running:  ${sudo} apt-get update  "
-    echo >&2
-  fi
-
   local opts=""
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
     echo >&2 "Running in non-interactive mode"
@@ -1279,11 +1465,24 @@ install_apt_get() {
 
   read -r -a apt_opts <<< "$opts"
 
+  # update apt repository caches
+
+  echo >&2 "NOTE: Running apt-get update and updating your APT caches ..."
+  if [ "${version}" = 8 ]; then
+    echo >&2 "WARNING: You seem to be on Debian 8 (jessie) which is old enough we have to disable Check-Valid-Until checks"
+    if ! cat /etc/apt/sources.list /etc/apt/sources.list.d/* 2> /dev/null | grep -q jessie-backports; then
+      echo >&2 "We also have to enable the jessie-backports repository"
+      if prompt "Is this okay?"; then
+        ${sudo} /bin/sh -c 'echo "deb http://archive.debian.org/debian/ jessie-backports main contrib non-free" >> /etc/apt/sources.list.d/99-archived.list'
+      fi
+    fi
+    run ${sudo} apt-get "${apt_opts[@]}" -o Acquire::Check-Valid-Until=false update
+  else
+    run ${sudo} apt-get "${apt_opts[@]}" update
+  fi
+
   # install the required packages
-  for pkg in "${@}"; do
-    [[ ${DRYRUN} -eq 0 ]] && echo >&2 "Adding package ${pkg}"
-    run ${sudo} apt-get "${apt_opts[@]}" install "${pkg}"
-  done
+  run ${sudo} apt-get "${apt_opts[@]}" install "${@}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1306,6 +1505,24 @@ prompt() {
   done
 }
 
+validate_tree_freebsd() {
+  local opts=
+  if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+    echo >&2 "Running in non-interactive mode"
+    opts="-y"
+  fi
+
+  echo >&2 " > FreeBSD Version: ${version} ..."
+
+  make="make"
+  echo >&2 " > Checking for gmake ..."
+  if ! pkg query %n-%v | grep -q gmake; then
+    if prompt "gmake is required to build on FreeBSD and is not installed. Shall I install it?"; then
+      run ${sudo} pkg install ${opts} gmake
+    fi
+  fi
+}
+
 validate_tree_centos() {
   local opts=
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
@@ -1322,7 +1539,7 @@ validate_tree_centos() {
     fi
   fi
 
-  if [ "$version" -eq 8 ]; then
+  if [[ "${version}" =~ ^8(\..*)?$ ]]; then
     echo >&2 " > Checking for config-manager ..."
     if ! run yum ${sudo} config-manager; then
       if prompt "config-manager not found, shall I install it?"; then
@@ -1337,12 +1554,16 @@ validate_tree_centos() {
       fi
     fi
 
-    echo >&2 " > Checking for getpagespeed-extras ..."
-    if ! run yum ${sudo} repolist | grep 'getpagespeed-extras'; then
-      if prompt "PowerTools not found, shall I install it?"; then
-        run ${sudo} yum ${opts} install https://extras.getpagespeed.com/release-el8-latest.rpm
+    echo >&2 " > Checking for Okay ..."
+    if ! rpm -qa | grep okay > /dev/null; then
+      if prompt "okay not found, shall I install it?"; then
+        run ${sudo} yum ${opts} install http://repo.okay.com.mx/centos/8/x86_64/release/okay-release-1-3.el8.noarch.rpm
       fi
     fi
+
+    echo >&2 " > Installing Judy-devel directly ..."
+    run ${sudo} yum ${opts} install http://mirror.centos.org/centos/8/PowerTools/x86_64/os/Packages/Judy-devel-1.0.5-18.module_el8.1.0+217+4d875839.x86_64.rpm
+
   elif [[ "${version}" =~ ^6\..*$ ]]; then
     echo >&2 " > Detected CentOS 6.x ..."
     echo >&2 " > Checking for Okay ..."
@@ -1351,6 +1572,7 @@ validate_tree_centos() {
         run ${sudo} yum ${opts} install http://repo.okay.com.mx/centos/6/x86_64/release/okay-release-1-3.el6.noarch.rpm
       fi
     fi
+
   fi
 }
 
@@ -1442,10 +1664,7 @@ install_emerge() {
   read -r -a emerge_opts <<< "$opts"
 
   # install the required packages
-  for pkg in "${@}"; do
-    [[ ${DRYRUN} -eq 0 ]] && echo >&2 "Adding package ${pkg}"
-    run ${sudo} emerge "${emerge_opts[@]}" -v --noreplace "${pkg}"
-  done
+  run ${sudo} emerge "${emerge_opts[@]}" -v --noreplace "${@}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1503,10 +1722,7 @@ install_equo() {
   read -r -a equo_opts <<< "$opts"
 
   # install the required packages
-  for pkg in "${@}"; do
-    [[ ${DRYRUN} -eq 0 ]] && echo >&2 "Adding package ${pkg}"
-    run ${sudo} equo i "${equo_opts[@]}" "${pkg}"
-  done
+  run ${sudo} equo i "${equo_opts[@]}" "${@}"
 }
 
 # -----------------------------------------------------------------------------
@@ -1562,17 +1778,10 @@ install_pacman() {
   if [ "${NON_INTERACTIVE}" -eq 1 ]; then
     echo >&2 "Running in non-interactive mode"
     # http://unix.stackexchange.com/questions/52277/pacman-option-to-assume-yes-to-every-question/52278
-    for pkg in "${@}"; do
-      [[ ${DRYRUN} -eq 0 ]] && echo >&2 "Adding package ${pkg}"
-      # Try the noconfirm option, if that fails, go with the legacy way for non-interactive
-      run ${sudo} pacman --noconfirm --needed -S "${pkg}" || yes | run ${sudo} pacman --needed -S "${pkg}"
-    done
-
+    # Try the noconfirm option, if that fails, go with the legacy way for non-interactive
+    run ${sudo} pacman --noconfirm --needed -S "${@}" || yes | run ${sudo} pacman --needed -S "${@}"
   else
-    for pkg in "${@}"; do
-      [[ ${DRYRUN} -eq 0 ]] && echo >&2 "Adding package ${pkg}"
-      run ${sudo} pacman --needed -S "${pkg}"
-    done
+    run ${sudo} pacman --needed -S "${@}"
   fi
 }
 
@@ -1625,6 +1834,49 @@ install_swupd() {
 }
 
 # -----------------------------------------------------------------------------
+# macOS
+
+validate_install_pkg() {
+  pkg query %n-%v | grep -q "${*}" || echo "${*}"
+}
+
+validate_install_brew() {
+  brew list | grep -q "${*}" || echo "${*}"
+}
+
+install_pkg() {
+  # download the latest package info
+  if [ "${DRYRUN}" -eq 1 ]; then
+    echo >&2 " >> IMPORTANT << "
+    echo >&2 "    Please make sure your system is up to date"
+    echo >&2 "    by running:  pkg update "
+    echo >&2
+  fi
+
+  local opts=
+  if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+    echo >&2 "Running in non-interactive mode"
+    opts="-y"
+  fi
+
+  read -r -a pkg_opts <<< "${opts}"
+
+  run ${sudo} pkg install "${pkg_opts[@]}" "${@}"
+}
+
+install_brew() {
+  # download the latest package info
+  if [ "${DRYRUN}" -eq 1 ]; then
+    echo >&2 " >> IMPORTANT << "
+    echo >&2 "    Please make sure your system is up to date"
+    echo >&2 "    by running:  brew upgrade "
+    echo >&2
+  fi
+
+  run brew install "${@}"
+}
+
+# -----------------------------------------------------------------------------
 
 install_failed() {
   local ret="${1}"
@@ -1648,7 +1900,7 @@ What to do now:
   3. Let us know. We may be able to help.
      Open a github issue with the above log, at:
 
-           https://github.com/firehol/netdata/issues
+           https://github.com/netdata/netdata/issues
 
 
 EOF
@@ -1659,12 +1911,25 @@ EOF
 remote_log() {
   # log success or failure on our system
   # to help us solve installation issues
-  curl > /dev/null 2>&1 -Ss --max-time 3 "https://registry.my-netdata.io/log/installer?status=${1}&error=${2}&distribution=${distribution}&version=${version}&installer=${package_installer}&tree=${tree}&detection=${detection}&netdata=${PACKAGES_NETDATA}&nodejs=${PACKAGES_NETDATA_NODEJS}&python=${PACKAGES_NETDATA_PYTHON}&python3=${PACKAGES_NETDATA_PYTHON3}&mysql=${PACKAGES_NETDATA_PYTHON_MYSQL}&postgres=${PACKAGES_NETDATA_PYTHON_POSTGRES}&pymongo=${PACKAGES_NETDATA_PYTHON_MONGO}&sensors=${PACKAGES_NETDATA_SENSORS}&database=${PACKAGES_NETDATA_DATABASE}&firehol=${PACKAGES_FIREHOL}&fireqos=${PACKAGES_FIREQOS}&iprange=${PACKAGES_IPRANGE}&update_ipsets=${PACKAGES_UPDATE_IPSETS}&demo=${PACKAGES_NETDATA_DEMO_SITE}"
+  curl > /dev/null 2>&1 -Ss --max-time 3 "https://registry.my-netdata.io/log/installer?status=${1}&error=${2}&distribution=${distribution}&version=${version}&installer=${package_installer}&tree=${tree}&detection=${detection}&netdata=${PACKAGES_NETDATA}&nodejs=${PACKAGES_NETDATA_NODEJS}&python=${PACKAGES_NETDATA_PYTHON}&python3=${PACKAGES_NETDATA_PYTHON3}&mysql=${PACKAGES_NETDATA_PYTHON_MYSQL}&postgres=${PACKAGES_NETDATA_PYTHON_POSTGRES}&pymongo=${PACKAGES_NETDATA_PYTHON_MONGO}&sensors=${PACKAGES_NETDATA_SENSORS}&database=${PACKAGES_NETDATA_DATABASE}&ebpf=${PACKAGES_NETDATA_EBPF}&firehol=${PACKAGES_FIREHOL}&fireqos=${PACKAGES_FIREQOS}&iprange=${PACKAGES_IPRANGE}&update_ipsets=${PACKAGES_UPDATE_IPSETS}&demo=${PACKAGES_NETDATA_DEMO_SITE}"
 }
 
 if [ -z "${1}" ]; then
   usage
   exit 1
+fi
+
+pv=$(python --version 2>&1)
+if [ "${tree}" = macos ]; then
+  pv=3
+elif [[ "${pv}" =~ ^Python\ 2.* ]]; then
+  pv=2
+elif [[ "${pv}" =~ ^Python\ 3.* ]]; then
+  pv=3
+elif [[ "${tree}" == "centos" ]] && [ "${version}" -lt 8 ]; then
+  pv=2
+else
+  pv=3
 fi
 
 # parse command line arguments
@@ -1708,18 +1973,27 @@ while [ -n "${1}" ]; do
     netdata-all)
       PACKAGES_NETDATA=1
       PACKAGES_NETDATA_NODEJS=1
-      PACKAGES_NETDATA_PYTHON=1
-      PACKAGES_NETDATA_PYTHON_MYSQL=1
-      PACKAGES_NETDATA_PYTHON_POSTGRES=1
-      PACKAGES_NETDATA_PYTHON_MONGO=1
+      if [ "${pv}" -eq 2 ]; then
+        PACKAGES_NETDATA_PYTHON=1
+        PACKAGES_NETDATA_PYTHON_MYSQL=1
+        PACKAGES_NETDATA_PYTHON_POSTGRES=1
+        PACKAGES_NETDATA_PYTHON_MONGO=1
+      else
+        PACKAGES_NETDATA_PYTHON3=1
+        PACKAGES_NETDATA_PYTHON3_MYSQL=1
+        PACKAGES_NETDATA_PYTHON3_POSTGRES=1
+        PACKAGES_NETDATA_PYTHON3_MONGO=1
+      fi
       PACKAGES_NETDATA_SENSORS=1
       PACKAGES_NETDATA_DATABASE=1
+      PACKAGES_NETDATA_EBPF=1
       ;;
 
     netdata)
       PACKAGES_NETDATA=1
-      PACKAGES_NETDATA_PYTHON=1
+      PACKAGES_NETDATA_PYTHON3=1
       PACKAGES_NETDATA_DATABASE=1
+      PACKAGES_NETDATA_EBPF=1
       ;;
 
     python | netdata-python)
@@ -1731,18 +2005,33 @@ while [ -n "${1}" ]; do
       ;;
 
     python-mysql | mysql-python | mysqldb | netdata-mysql)
-      PACKAGES_NETDATA_PYTHON=1
-      PACKAGES_NETDATA_PYTHON_MYSQL=1
+      if [ "${pv}" -eq 2 ]; then
+        PACKAGES_NETDATA_PYTHON=1
+        PACKAGES_NETDATA_PYTHON_MYSQL=1
+      else
+        PACKAGES_NETDATA_PYTHON3=1
+        PACKAGES_NETDATA_PYTHON3_MYSQL=1
+      fi
       ;;
 
     python-postgres | postgres-python | psycopg2 | netdata-postgres)
-      PACKAGES_NETDATA_PYTHON=1
-      PACKAGES_NETDATA_PYTHON_POSTGRES=1
+      if [ "${pv}" -eq 2 ]; then
+        PACKAGES_NETDATA_PYTHON=1
+        PACKAGES_NETDATA_PYTHON_POSTGRES=1
+      else
+        PACKAGES_NETDATA_PYTHON3=1
+        PACKAGES_NETDATA_PYTHON3_POSTGRES=1
+      fi
       ;;
 
     python-pymongo)
-      PACKAGES_NETDATA_PYTHON=1
-      PACKAGES_NETDATA_PYTHON_MONGO=1
+      if [ "${pv}" -eq 2 ]; then
+        PACKAGES_NETDATA_PYTHON=1
+        PACKAGES_NETDATA_PYTHON_MONGO=1
+      else
+        PACKAGES_NETDATA_PYTHON3=1
+        PACKAGES_NETDATA_PYTHON3_MONGO=1
+      fi
       ;;
 
     nodejs | netdata-nodejs)
@@ -1753,7 +2042,7 @@ while [ -n "${1}" ]; do
 
     sensors | netdata-sensors)
       PACKAGES_NETDATA=1
-      PACKAGES_NETDATA_PYTHON=1
+      PACKAGES_NETDATA_PYTHON3=1
       PACKAGES_NETDATA_SENSORS=1
       PACKAGES_NETDATA_DATABASE=1
       ;;
@@ -1769,11 +2058,17 @@ while [ -n "${1}" ]; do
     demo | all)
       PACKAGES_NETDATA=1
       PACKAGES_NETDATA_NODEJS=1
-      PACKAGES_NETDATA_PYTHON=1
-      PACKAGES_NETDATA_PYTHON3=1
-      PACKAGES_NETDATA_PYTHON_MYSQL=1
-      PACKAGES_NETDATA_PYTHON_POSTGRES=1
-      PACKAGES_NETDATA_PYTHON_MONGO=1
+      if [ "${pv}" -eq 2 ]; then
+        PACKAGES_NETDATA_PYTHON=1
+        PACKAGES_NETDATA_PYTHON_MYSQL=1
+        PACKAGES_NETDATA_PYTHON_POSTGRES=1
+        PACKAGES_NETDATA_PYTHON_MONGO=1
+      else
+        PACKAGES_NETDATA_PYTHON3=1
+        PACKAGES_NETDATA_PYTHON3_MYSQL=1
+        PACKAGES_NETDATA_PYTHON3_POSTGRES=1
+        PACKAGES_NETDATA_PYTHON3_MONGO=1
+      fi
       PACKAGES_DEBUG=1
       PACKAGES_IPRANGE=1
       PACKAGES_FIREHOL=1
@@ -1781,6 +2076,7 @@ while [ -n "${1}" ]; do
       PACKAGES_UPDATE_IPSETS=1
       PACKAGES_NETDATA_DEMO_SITE=1
       PACKAGES_NETDATA_DATABASE=1
+      PACKAGES_NETDATA_EBPF=1
       ;;
 
     help | -h | --help)
@@ -1820,16 +2116,6 @@ if [ -z "${package_installer}" ] || [ -z "${tree}" ]; then
 
   # Validate package manager trees
   validate_package_trees
-fi
-
-pv=$(python --version 2>&1)
-if [[ "${pv}" =~ ^Python\ 2.* ]]; then
-  pv=2
-elif [[ "${pv}" =~ ^Python\ 3.* ]]; then
-  pv=3
-  PACKAGES_NETDATA_PYTHON3=1
-else
-  pv=2
 fi
 
 [ "${detection}" = "/etc/os-release" ] && cat << EOF
